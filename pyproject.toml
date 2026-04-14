@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "fleet-cicd-agent"
+version = "0.1.0"
+description = "Continuous Integration and Continuous Deployment for the Pelagic fleet"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+keywords = ["cicd", "ci", "cd", "fleet", "pipeline", "automation"]
+
+[project.scripts]
+fleet-cicd = "cli:main"
+
+[tool.setuptools.packages.find]
+include = ["*.py"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+
+[tool.coverage.run]
+source = ["."]
+omit = ["tests/*"]
