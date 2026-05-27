@@ -1,716 +1,805 @@
 """
-Tests for Fleet CI/CD Agent
+Tests for cicd_agent package
 =============================
-Comprehensive tests for the CI/CD pipeline engine, git poller,
-test runner, reporter, webhook server, CLI, and pipeline execution.
+Comprehensive tests covering stages, pipelines, artifacts, triggers,
+and deployment strategies. Uses only unittest + dataclasses.
 """
 
 from __future__ import annotations
 
-import hashlib
-import hmac
-import json
 import os
 import sys
 import tempfile
 import threading
 import time
 import unittest
-from http.client import HTTPConnection
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock
 
-# Add the parent directory to the path so we can import our modules
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from cicd import (
-    ArtifactManager,
-    DeployManager,
-    FleetCICD,
-    NotificationManager,
-    PipelineConfig,
-    PipelineRun,
-    PipelineRunner,
-    PipelineStatus,
-    StageName,
-    StageResult,
-)
-from git_poller import GitCommit, GitPoller
-from test_runner import TestResult, TestRunner
-from reporter import CIReporter
-from webhook_server import WebhookServer, parse_github_push_event
+from cicd_agent.stage import Stage, StageName, StageResult, StageStatus
+from cicd_agent.pipeline import Pipeline, PipelineConfig, PipelineRun, PipelineStatus
+from cicd_agent.artifact import Artifact, ArtifactManager
+from cicd_agent.trigger import TriggerCallback, TriggerEvent, TriggerManager, TriggerType
+from cicd_agent.deploy import Deployer, DeployResult, DeployStrategy
 
 
 # ===================================================================
-# Pipeline Config Tests
+# Stage Tests
 # ===================================================================
 
-class TestPipelineConfig(unittest.TestCase):
-    """Test PipelineConfig dataclass."""
-
-    def test_default_values(self):
-        config = PipelineConfig(repo_name="test-agent")
-        self.assertEqual(config.repo_name, "test-agent")
-        self.assertEqual(config.test_command, "python3 -m pytest tests/ -q")
-        self.assertEqual(config.lint_command, "python3 -m py_compile")
-        self.assertFalse(config.auto_deploy)
-        self.assertEqual(config.deploy_target, "local")
-        self.assertEqual(config.max_retries, 2)
-        self.assertEqual(config.timeout, 120)
-
-    def test_custom_values(self):
-        config = PipelineConfig(
-            repo_name="custom-agent",
-            test_command="python3 -m pytest -x",
-            lint_command="flake8",
-            auto_deploy=True,
-            deploy_target="docker",
-            max_retries=3,
-            timeout=300,
-        )
-        self.assertEqual(config.repo_name, "custom-agent")
-        self.assertTrue(config.auto_deploy)
-        self.assertEqual(config.deploy_target, "docker")
-        self.assertEqual(config.max_retries, 3)
-        self.assertEqual(config.timeout, 300)
-
-    def test_notify_on_default(self):
-        config = PipelineConfig(repo_name="test")
-        self.assertIn("failure", config.notify_on)
-        self.assertIn("recovery", config.notify_on)
-
-    def test_skip_patterns_default(self):
-        config = PipelineConfig(repo_name="test")
-        self.assertIn("[skip-ci]", config.skip_patterns)
-
-    def test_serialization(self):
-        from dataclasses import asdict
-        config = PipelineConfig(repo_name="test-agent")
-        d = asdict(config)
-        self.assertEqual(d["repo_name"], "test-agent")
-        self.assertIn("test_command", d)
-        self.assertIn("notify_on", d)
-
-
-# ===================================================================
-# Git Poller Tests (with mock git)
-# ===================================================================
-
-class TestGitPoller(unittest.TestCase):
-    """Test GitPoller with mocked git commands."""
-
-    def setUp(self):
-        self.poller = GitPoller(interval=30)
-
-    def test_add_repo(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # Mock _get_head_sha to simulate a git repo
-            self.poller._get_head_sha = lambda p, b: "abc123" * 5
-            self.poller.add_repo("test-repo", tmpdir, "main")
-            self.assertIn("test-repo", self.poller._repos)
-            self.assertEqual(self.poller._last_known["test-repo"], "abc123" * 5)
-
-    def test_remove_repo(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            self.poller._get_head_sha = lambda p, b: "abc123" * 5
-            self.poller.add_repo("test-repo", tmpdir)
-            result = self.poller.remove_repo("test-repo")
-            self.assertTrue(result)
-            self.assertNotIn("test-repo", self.poller._repos)
-
-    def test_remove_nonexistent_repo(self):
-        result = self.poller.remove_repo("no-such-repo")
-        self.assertFalse(result)
-
-    def test_set_interval(self):
-        self.poller.set_interval(120)
-        self.assertEqual(self.poller.interval, 120)
-
-    def test_set_last_known(self):
-        self.poller.set_last_known("repo1", "sha123")
-        self.assertEqual(self.poller.get_last_known("repo1"), "sha123")
-
-    def test_get_last_known_missing(self):
-        self.assertIsNone(self.poller.get_last_known("nonexistent"))
-
-    def test_extract_tags(self):
-        tags = self.poller._extract_tags("[skip-ci] fix typo")
-        self.assertIn("skip-ci", tags)
-
-        tags = self.poller._extract_tags("[deploy][urgent] hotfix")
-        self.assertIn("deploy", tags)
-        self.assertIn("urgent", tags)
-
-        tags = self.poller._extract_tags("normal commit")
-        self.assertEqual(tags, [])
-
-    def test_poll_with_mock(self):
-        """Test polling with a mocked git environment."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            self.poller._get_head_sha = MagicMock(side_effect=["sha_old", "sha_new"])
-            self.poller._git_fetch = MagicMock(return_value=True)
-            self.poller._get_new_commits = MagicMock(return_value=[
-                GitCommit(sha="sha_new", author="Test", message="fix: bug fix"),
-            ])
-
-            self.poller.add_repo("mock-repo", tmpdir, "main")
-            # Reset the last known so poll detects changes
-            self.poller._last_known["mock-repo"] = "sha_old"
-
-            results = self.poller.poll_all()
-            self.assertIn("mock-repo", results)
-            self.assertEqual(len(results["mock-repo"]), 1)
-            self.assertEqual(results["mock-repo"][0].sha, "sha_new")
-
-    def test_get_status(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            self.poller._get_head_sha = lambda p, b: "sha1"
-            self.poller.add_repo("repo1", tmpdir)
-            status = self.poller.get_status()
-            self.assertEqual(status["interval"], 30)
-            self.assertIn("repo1", status["repos"])
-
-    def test_poll_repo_not_found(self):
-        result = self.poller.poll_repo("nonexistent")
-        self.assertEqual(result, [])
-
-
-# ===================================================================
-# Test Runner Tests (with mock pytest)
-# ===================================================================
-
-class TestTestRunner(unittest.TestCase):
-    """Test TestRunner with mocked subprocess."""
-
-    def test_run_success(self):
-        """Test running a successful test command."""
-        runner = TestRunner(timeout=10)
-        result = runner.run("echo '3 passed' && exit 0")
-        self.assertTrue(result.success)
-        self.assertEqual(result.exit_code, 0)
-        self.assertGreater(result.duration, 0)
-
-    def test_run_failure(self):
-        """Test running a failing test command."""
-        runner = TestRunner(timeout=10)
-        result = runner.run("echo '1 failed' && exit 1")
-        self.assertFalse(result.success)
-        self.assertEqual(result.exit_code, 1)
-
-    def test_parse_pytest_output(self):
-        """Test parsing pytest summary output."""
-        runner = TestRunner()
-        stdout = "test_foo.py ... 5 passed, 2 failed, 1 skipped in 1.23s"
-        result = runner._parse_result("pytest", ".", 1, stdout, "", 1.5)
-        self.assertEqual(result.passed, 5)
-        self.assertEqual(result.failed, 2)
-        self.assertEqual(result.skipped, 1)
-
-    def test_parse_simple_passed(self):
-        """Test parsing simple 'N passed' output."""
-        runner = TestRunner()
-        stdout = "10 passed"
-        result = runner._parse_result("pytest", ".", 0, stdout, "", 0.5)
-        self.assertEqual(result.passed, 10)
-        self.assertEqual(result.failed, 0)
-
-    def test_parse_no_output(self):
-        """Test parsing empty output."""
-        runner = TestRunner()
-        result = runner._parse_result("pytest", ".", 0, "", "", 0.1)
-        self.assertEqual(result.passed, 0)
-        self.assertEqual(result.failed, 0)
-
-    def test_timeout_handling(self):
-        """Test that timeout is handled gracefully."""
-        runner = TestRunner(timeout=1)
-        result = runner.run("sleep 10", cwd=".")
-        self.assertEqual(result.exit_code, -1)
-        self.assertIn("timed out", result.stderr)
-
-    def test_result_to_dict(self):
-        """Test TestResult serialization."""
-        result = TestResult(
-            command="pytest",
-            cwd="/tmp",
-            exit_code=0,
-            passed=5,
-            failed=0,
-            skipped=1,
-            duration=1.5,
-        )
-        d = result.to_dict()
-        self.assertEqual(d["passed"], 5)
-        self.assertEqual(d["failed"], 0)
-        self.assertEqual(d["skipped"], 1)
-        self.assertEqual(d["exit_code"], 0)
-        self.assertIn("command", d)
-
-    def test_history_tracking(self):
-        """Test that runs are tracked in history."""
-        runner = TestRunner()
-        runner.run("echo '1 passed' && exit 0")
-        runner.run("echo '2 passed' && exit 0")
-        history = runner.get_history()
-        self.assertEqual(len(history), 2)
-
-    def test_clear_history(self):
-        """Test clearing history."""
-        runner = TestRunner()
-        runner.run("echo '1 passed' && exit 0")
-        runner.clear_history()
-        self.assertEqual(len(runner.get_history()), 0)
-
-    def test_trend_analysis(self):
-        """Test trend analysis."""
-        runner = TestRunner()
-        runner.run("echo '5 passed' && exit 0")
-        runner.run("echo '5 passed' && exit 0")
-        trend = runner.get_trend()
-        self.assertEqual(trend["total_runs"], 2)
-        self.assertEqual(trend["passed"], 2)
-
-    def test_parallel_run(self):
-        """Test parallel test execution."""
-        runner = TestRunner(workers=2)
-        commands = [
-            ("repo1", "echo '1 passed' && exit 0", "."),
-            ("repo2", "echo '2 passed' && exit 0", "."),
-        ]
-        results = runner.run_parallel(commands)
-        self.assertIn("repo1", results)
-        self.assertIn("repo2", results)
-        self.assertTrue(results["repo1"].success)
-        self.assertTrue(results["repo2"].success)
-
-    def test_parallel_failure(self):
-        """Test parallel execution with a failure."""
-        runner = TestRunner(workers=2)
-        commands = [
-            ("repo1", "echo '1 passed' && exit 0", "."),
-            ("repo2", "echo 'failed' && exit 1", "."),
-        ]
-        results = runner.run_parallel(commands)
-        self.assertTrue(results["repo1"].success)
-        self.assertFalse(results["repo2"].success)
-
-
-# ===================================================================
-# Reporter Tests
-# ===================================================================
-
-class TestCIReporter(unittest.TestCase):
-    """Test CI/CD report generation."""
-
-    def setUp(self):
-        self.reporter = CIReporter()
-        self.run = PipelineRun(
-            run_id="test-20250101-120000",
-            repo_name="test-agent",
-            status=PipelineStatus.PASSED,
-            trigger="poll",
-            commit_sha="a" * 40,
-            commit_message="fix: resolve bug in handler",
-            branch="main",
-            total_duration=15.5,
-            stages=[
-                StageResult(
-                    stage=StageName.TEST,
-                    status=PipelineStatus.PASSED,
-                    duration=5.0,
-                    message="Tests: 10 passed, 0 failed",
-                    data={"passed": 10, "failed": 0, "skipped": 1, "errors": 0, "total": 11},
-                ),
-                StageResult(
-                    stage=StageName.LINT,
-                    status=PipelineStatus.PASSED,
-                    duration=2.0,
-                    message="Linted 25 files, 0 errors",
-                ),
-                StageResult(
-                    stage=StageName.VALIDATE,
-                    status=PipelineStatus.PASSED,
-                    duration=0.1,
-                    message="All checks passed",
-                ),
-            ],
-        )
-
-    def test_json_report(self):
-        report = self.reporter.generate_json(self.run)
-        self.assertEqual(report["run_id"], "test-20250101-120000")
-        self.assertEqual(report["repo_name"], "test-agent")
-        self.assertEqual(report["status"], "passed")
-        self.assertIn("_report_meta", report)
-        self.assertEqual(report["_report_meta"]["format"], "json")
-
-    def test_text_report(self):
-        report = self.reporter.generate_text(self.run)
-        self.assertIn("FLEET CI/CD REPORT", report)
-        self.assertIn("test-agent", report)
-        self.assertIn("PASSED", report)
-        self.assertIn("test", report)
-        self.assertIn("10 passed", report)
-
-    def test_markdown_report(self):
-        report = self.reporter.generate_markdown(self.run)
-        self.assertIn("# CI/CD Report", report)
-        self.assertIn("test-agent", report)
-        self.assertIn("Pipeline Stages", report)
-        self.assertIn("Test Results", report)
-        self.assertIn("Fleet CI/CD Agent", report)
-
-    def test_text_report_failed(self):
-        self.run.status = PipelineStatus.FAILED
-        report = self.reporter.generate_text(self.run)
-        self.assertIn("FAILED", report)
-
-    def test_trend_report(self):
-        runs = [self.run]
-        trend = self.reporter.generate_trend(runs)
-        self.assertEqual(trend["total_runs"], 1)
-        self.assertEqual(trend["passed"], 1)
-        self.assertEqual(trend["pass_rate"], "100.0%")
-
-    def test_trend_empty(self):
-        trend = self.reporter.generate_trend([])
-        self.assertEqual(trend["total_runs"], 0)
-
-    def test_trend_multiple(self):
-        passed_run = PipelineRun(
-            run_id="p1", repo_name="test",
-            status=PipelineStatus.PASSED, total_duration=10.0,
-        )
-        failed_run = PipelineRun(
-            run_id="f1", repo_name="test",
-            status=PipelineStatus.FAILED, total_duration=5.0,
-        )
-        trend = self.reporter.generate_trend([passed_run, failed_run])
-        self.assertEqual(trend["total_runs"], 2)
-        self.assertEqual(trend["pass_rate"], "50.0%")
-        self.assertEqual(trend["avg_duration"], 7.5)
-
-    def test_report_from_dict(self):
-        """Test generating report from a plain dict."""
-        data = {"run_id": "d1", "repo_name": "dict-repo", "status": "passed"}
-        report = self.reporter.generate_json(data)
-        self.assertEqual(report["run_id"], "d1")
-
-    def test_status_emoji(self):
-        self.assertEqual(CIReporter._status_emoji("passed"), "✅")
-        self.assertEqual(CIReporter._status_emoji("failed"), "❌")
-        self.assertEqual(CIReporter._status_emoji("running"), "🔄")
-        self.assertEqual(CIReporter._status_emoji("unknown"), "  ")
-
-
-# ===================================================================
-# Webhook Parsing Tests
-# ===================================================================
-
-class TestWebhookParsing(unittest.TestCase):
-    """Test webhook event parsing."""
-
-    def test_parse_push_event(self):
-        payload = {
-            "ref": "refs/heads/main",
-            "after": "abc123",
-            "repository": {"full_name": "fleet/agent-1", "name": "agent-1"},
-            "commits": [
-                {
-                    "id": "sha1",
-                    "author": {"name": "Developer"},
-                    "message": "fix: bug fix [skip-ci]",
-                    "added": ["new_file.py"],
-                    "modified": ["existing.py"],
-                    "removed": [],
-                }
-            ],
-        }
-        result = parse_github_push_event(payload)
-        self.assertEqual(result["repo"], "fleet/agent-1")
-        self.assertEqual(result["branch"], "main")
-        self.assertEqual(result["after"], "abc123")
-        self.assertEqual(len(result["commits"]), 1)
-        self.assertEqual(result["commits"][0]["sha"], "sha1")
-        self.assertIn("new_file.py", result["changed_files"])
-        self.assertIn("existing.py", result["changed_files"])
-
-    def test_parse_push_no_commits(self):
-        payload = {
-            "ref": "refs/heads/main",
-            "after": "abc123",
-            "repository": {"full_name": "fleet/agent"},
-            "commits": [],
-        }
-        result = parse_github_push_event(payload)
-        self.assertEqual(len(result["commits"]), 0)
-        self.assertEqual(len(result["changed_files"]), 0)
-
-    def test_parse_non_heads_ref(self):
-        payload = {
-            "ref": "refs/tags/v1.0",
-            "repository": {"name": "agent"},
-            "commits": [],
-        }
-        result = parse_github_push_event(payload)
-        self.assertEqual(result["branch"], "refs/tags/v1.0")
-
-    def test_signature_verification(self):
-        server = WebhookServer(secret="my-secret")
-        payload = b'{"test": true}'
-        sig = "sha256=" + hmac.new(b"my-secret", payload, hashlib.sha256).hexdigest()
-        self.assertTrue(server.verify_signature(payload, sig))
-
-    def test_signature_wrong_secret(self):
-        server = WebhookServer(secret="my-secret")
-        payload = b'{"test": true}'
-        sig = "sha256=" + hmac.new(b"wrong-secret", payload, hashlib.sha256).hexdigest()
-        self.assertFalse(server.verify_signature(payload, sig))
-
-    def test_signature_no_secret(self):
-        server = WebhookServer(secret="")
-        payload = b'{"test": true}'
-        self.assertTrue(server.verify_signature(payload, ""))
-
-    def test_record_event(self):
-        server = WebhookServer()
-        server.record_event({"event": "push", "repo": "test"})
-        self.assertEqual(len(server.received_events), 1)
-        self.assertEqual(server.received_events[0]["event"], "push")
-
-
-# ===================================================================
-# CLI Arguments Tests
-# ===================================================================
-
-class TestCLIArguments(unittest.TestCase):
-    """Test CLI argument parsing."""
-
-    def setUp(self):
-        # Import here to avoid side effects
-        from cli import build_parser
-        self.parser = build_parser()
-
-    def test_serve_defaults(self):
-        args = self.parser.parse_args(["serve"])
-        self.assertEqual(args.command, "serve")
-        self.assertEqual(args.interval, 60)
-        self.assertEqual(args.webhook_port, 9000)
-
-    def test_serve_custom(self):
-        args = self.parser.parse_args([
-            "serve", "--interval", "30", "--webhook-port", "8080",
-        ])
-        self.assertEqual(args.interval, 30)
-        self.assertEqual(args.webhook_port, 8080)
-
-    def test_run_repo(self):
-        args = self.parser.parse_args(["run", "--repo", "my-agent"])
-        self.assertEqual(args.repo, "my-agent")
-        self.assertFalse(args.all_flag)
-
-    def test_run_all(self):
-        args = self.parser.parse_args(["run", "--all"])
-        self.assertTrue(args.all_flag)
-
-    def test_history(self):
-        args = self.parser.parse_args(["history", "--limit", "10"])
-        self.assertEqual(args.command, "history")
-        self.assertEqual(args.limit, 10)
-
-    def test_report_format(self):
-        args = self.parser.parse_args(["report", "--format", "json"])
-        self.assertEqual(args.format, "json")
-
-    def test_report_markdown(self):
-        args = self.parser.parse_args(["report", "--format", "markdown"])
-        self.assertEqual(args.format, "markdown")
-
-    def test_webhook_serve(self):
-        args = self.parser.parse_args(["webhook-serve", "--port", "7000"])
-        self.assertEqual(args.port, 7000)
-
-    def test_onboard(self):
-        args = self.parser.parse_args(["onboard"])
-        self.assertEqual(args.command, "onboard")
-
-    def test_no_command(self):
-        args = self.parser.parse_args([])
-        self.assertIsNone(args.command)
-
-
-# ===================================================================
-# Pipeline Execution Flow Tests
-# ===================================================================
-
-class TestPipelineExecution(unittest.TestCase):
-    """Test end-to-end pipeline execution."""
-
-    def test_fleet_cicd_init(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            cicd = FleetCICD(config_dir=tmpdir)
-            self.assertIsNotNone(cicd.artifacts)
-            self.assertIsNotNone(cicd.deploy_mgr)
-            self.assertIsNotNone(cicd.notifier)
-
-    def test_add_remove_repo(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            cicd = FleetCICD(config_dir=tmpdir)
-            config = PipelineConfig(repo_name="test", repo_path=tmpdir)
-            cicd.add_repo(config)
-            repos = cicd.list_repos()
-            self.assertEqual(len(repos), 1)
-            self.assertEqual(repos[0]["name"], "test")
-
-            cicd.remove_repo("test")
-            self.assertEqual(len(cicd.list_repos()), 0)
-
-    def test_run_repo_missing(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            cicd = FleetCICD(config_dir=tmpdir)
-            result = cicd.run_repo("nonexistent")
-            self.assertIsNone(result)
-
-    def test_get_status(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            cicd = FleetCICD(config_dir=tmpdir)
-            status = cicd.get_status()
-            self.assertEqual(status["repos_monitored"], 0)
-            self.assertFalse(status["polling"])
-            self.assertFalse(status["webhook"])
-
-    def test_get_history_empty(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            cicd = FleetCICD(config_dir=tmpdir)
-            history = cicd.get_history()
-            self.assertEqual(history, [])
-
-    def test_artifact_manager(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            artifacts = ArtifactManager(base_dir=tmpdir)
-            path = artifacts.save_report("test-run", {"key": "value"}, "json")
-            self.assertTrue(path.exists())
-            with open(path) as f:
-                data = json.load(f)
-            self.assertEqual(data["key"], "value")
-
-    def test_artifact_list_reports(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            artifacts = ArtifactManager(base_dir=tmpdir)
-            artifacts.save_report("run1", {"id": 1}, "json")
-            artifacts.save_report("run2", {"id": 2}, "json")
-            reports = artifacts.list_reports()
-            self.assertEqual(len(reports), 2)
-
-    def test_notification_manager(self):
-        notifier = NotificationManager(notify_channels=["log"])
-        config = PipelineConfig(repo_name="test")
-        run = PipelineRun(
-            run_id="test-run",
-            repo_name="test",
-            status=PipelineStatus.FAILED,
-            total_duration=5.0,
-        )
-        notifier.notify(run, config)
-        self.assertEqual(len(notifier.history), 1)
-
-    def test_notification_skip(self):
-        notifier = NotificationManager(notify_channels=["log"])
-        config = PipelineConfig(repo_name="test", notify_on=["failure"])
-        run = PipelineRun(
-            run_id="test-run",
-            repo_name="test",
-            status=PipelineStatus.PASSED,
-            total_duration=5.0,
-        )
-        # "recovery" not in notify_on, but "success" won't be checked
-        notifier.notify(run, config)
-        # Should not notify since only "failure" triggers
-        # Actually, PASSED triggers "recovery" and "success" — notify_on has "failure" only
-        self.assertEqual(len(notifier.history), 0)
-
-    def test_deploy_manager_local(self):
-        dm = DeployManager()
-        with tempfile.TemporaryDirectory() as tmpdir:
-            result = dm.deploy("local", tmpdir)
-            self.assertTrue(result["success"])  # No install script = skip
-
-    def test_deploy_manager_unknown(self):
-        dm = DeployManager()
-        result = dm.deploy("kubernetes", "/tmp")
-        self.assertFalse(result["success"])
-        self.assertIn("Unknown deploy target", result["message"])
-
-    def test_pipeline_runner_skip_ci(self):
-        """Test that [skip-ci] commits skip the pipeline."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            config = PipelineConfig(repo_name="test", repo_path=tmpdir)
-            artifacts = ArtifactManager(base_dir=str(Path(tmpdir) / "artifacts"))
-            deploy_mgr = DeployManager()
-            notifier = NotificationManager()
-
-            runner = PipelineRunner(
-                repo_path=tmpdir,
-                config=config,
-                artifacts=artifacts,
-                deploy_mgr=deploy_mgr,
-                notifier=notifier,
-            )
-            run = runner.run_pipeline(
-                trigger="poll",
-                commit_message="[skip-ci] trivial change",
-            )
-            self.assertEqual(run.status, PipelineStatus.SKIPPED)
-
-    def test_pipeline_runner_no_skip(self):
-        """Test that normal commits run the pipeline."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            config = PipelineConfig(repo_name="test", repo_path=tmpdir)
-            artifacts = ArtifactManager(base_dir=str(Path(tmpdir) / "artifacts"))
-            deploy_mgr = DeployManager()
-            notifier = NotificationManager()
-
-            runner = PipelineRunner(
-                repo_path=tmpdir,
-                config=config,
-                artifacts=artifacts,
-                deploy_mgr=deploy_mgr,
-                notifier=notifier,
-            )
-            run = runner.run_pipeline(
-                trigger="manual",
-                commit_message="fix: real bug fix",
-            )
-            # Pipeline should have run (may pass or fail depending on test results)
-            self.assertNotEqual(run.status, PipelineStatus.SKIPPED)
-            self.assertGreater(len(run.stages), 0)
-
-    def test_stage_result_serialization(self):
-        sr = StageResult(
-            stage=StageName.TEST,
-            status=PipelineStatus.PASSED,
-            duration=1.5,
-            message="All tests passed",
-        )
+class TestStageStatus(unittest.TestCase):
+    def test_all_values(self):
+        expected = {"pending", "running", "passed", "failed", "skipped", "cancelled", "warning"}
+        self.assertEqual({s.value for s in StageStatus}, expected)
+
+
+class TestStageResult(unittest.TestCase):
+    def test_to_dict(self):
+        sr = StageResult(name="test", status=StageStatus.PASSED, duration=1.5, message="ok")
         d = sr.to_dict()
-        self.assertEqual(d["stage"], "test")
+        self.assertEqual(d["name"], "test")
         self.assertEqual(d["status"], "passed")
         self.assertEqual(d["duration"], 1.5)
 
-    def test_pipeline_run_serialization(self):
+    def test_ok_property(self):
+        self.assertTrue(StageResult(name="x", status=StageStatus.PASSED).ok)
+        self.assertTrue(StageResult(name="x", status=StageStatus.WARNING).ok)
+        self.assertTrue(StageResult(name="x", status=StageStatus.SKIPPED).ok)
+        self.assertFalse(StageResult(name="x", status=StageStatus.FAILED).ok)
+        self.assertFalse(StageResult(name="x", status=StageStatus.RUNNING).ok)
+
+    def test_default_fields(self):
+        sr = StageResult(name="x", status=StageStatus.PENDING)
+        self.assertEqual(sr.artifacts, [])
+        self.assertEqual(sr.warnings, [])
+        self.assertEqual(sr.data, {})
+
+
+class TestStage(unittest.TestCase):
+    def _pass_action(self, ctx):
+        return StageResult(name="test", status=StageStatus.PASSED, message="done")
+
+    def _fail_action(self, ctx):
+        return StageResult(name="test", status=StageStatus.FAILED, message="oops")
+
+    def _exception_action(self, ctx):
+        raise RuntimeError("boom")
+
+    def test_execute_pass(self):
+        s = Stage(name="test", action=self._pass_action)
+        result = s.execute({})
+        self.assertEqual(result.status, StageStatus.PASSED)
+        self.assertEqual(result.name, "test")
+        self.assertIsNotNone(result.started_at)
+        self.assertIsNotNone(result.finished_at)
+        self.assertGreater(result.duration, -0.01)
+
+    def test_execute_fail(self):
+        s = Stage(name="test", action=self._fail_action)
+        result = s.execute({})
+        self.assertEqual(result.status, StageStatus.FAILED)
+
+    def test_execute_exception(self):
+        s = Stage(name="test", action=self._exception_action)
+        result = s.execute({})
+        self.assertEqual(result.status, StageStatus.FAILED)
+        self.assertIn("boom", result.message)
+
+    def test_retry_on_fail(self):
+        attempts = {"n": 0}
+        def retry_action(ctx):
+            attempts["n"] += 1
+            if attempts["n"] < 3:
+                return StageResult(name="r", status=StageStatus.FAILED)
+            return StageResult(name="r", status=StageStatus.PASSED)
+
+        s = Stage(name="retry-test", action=retry_action, retry_count=3, retry_delay=0.01)
+        result = s.execute({})
+        self.assertEqual(result.status, StageStatus.PASSED)
+        self.assertEqual(attempts["n"], 3)
+
+    def test_to_dict(self):
+        s = Stage(name="build", action=self._pass_action, depends_on=["init"], gate=True)
+        d = s.to_dict()
+        self.assertEqual(d["name"], "build")
+        self.assertEqual(d["depends_on"], ["init"])
+        self.assertTrue(d["gate"])
+
+    def test_action_returns_bool(self):
+        """Action returning True/False instead of StageResult."""
+        s = Stage(name="bool-test", action=lambda ctx: True)
+        result = s.execute({})
+        self.assertEqual(result.status, StageStatus.PASSED)
+
+        s2 = Stage(name="bool-fail", action=lambda ctx: False)
+        result2 = s2.execute({})
+        self.assertEqual(result2.status, StageStatus.FAILED)
+
+
+# ===================================================================
+# Pipeline Tests
+# ===================================================================
+
+class TestPipelineConfig(unittest.TestCase):
+    def test_defaults(self):
+        cfg = PipelineConfig()
+        self.assertEqual(cfg.name, "default")
+        self.assertEqual(cfg.max_workers, 4)
+        self.assertFalse(cfg.fail_fast)
+
+    def test_should_skip(self):
+        cfg = PipelineConfig()
+        self.assertTrue(cfg.should_skip("[skip-ci] quick fix"))
+        self.assertFalse(cfg.should_skip("fix: normal fix"))
+        self.assertFalse(cfg.should_skip(""))
+
+
+class TestPipelineRun(unittest.TestCase):
+    def test_auto_run_id(self):
+        run = PipelineRun(pipeline_name="test")
+        self.assertIn("test", run.run_id)
+
+    def test_to_dict(self):
         run = PipelineRun(
-            run_id="run-1",
-            repo_name="agent-1",
+            pipeline_name="p",
             status=PipelineStatus.PASSED,
-            total_duration=10.0,
-            stages=[
-                StageResult(stage=StageName.TEST, status=PipelineStatus.PASSED),
-            ],
+            stage_results=[StageResult(name="s", status=StageStatus.PASSED)],
         )
         d = run.to_dict()
-        self.assertEqual(d["run_id"], "run-1")
+        self.assertEqual(d["pipeline_name"], "p")
         self.assertEqual(d["status"], "passed")
-        self.assertEqual(len(d["stages"]), 1)
+        self.assertEqual(len(d["stage_results"]), 1)
+
+    def test_passed_property(self):
+        self.assertTrue(PipelineRun(status=PipelineStatus.PASSED).passed)
+        self.assertTrue(PipelineRun(status=PipelineStatus.PARTIAL).passed)
+        self.assertFalse(PipelineRun(status=PipelineStatus.FAILED).passed)
+
+
+class TestPipeline(unittest.TestCase):
+    def _make_pass(self, name):
+        return Stage(name=name, action=lambda ctx: StageResult(name=name, status=StageStatus.PASSED))
+
+    def _make_fail(self, name):
+        return Stage(name=name, action=lambda ctx: StageResult(name=name, status=StageStatus.FAILED))
+
+    def test_add_remove_stage(self):
+        p = Pipeline()
+        p.add_stage(self._make_pass("build"))
+        self.assertIn("build", p.list_stages())
+        p.remove_stage("build")
+        self.assertNotIn("build", p.list_stages())
+
+    def test_simple_pipeline(self):
+        p = Pipeline()
+        p.add_stage(self._make_pass("build"))
+        p.add_stage(self._make_pass("test"))
+        run = p.execute()
+        self.assertEqual(run.status, PipelineStatus.PASSED)
+        self.assertEqual(len(run.stage_results), 2)
+
+    def test_pipeline_with_deps(self):
+        results = {}
+        def build_action(ctx):
+            results["build"] = True
+            return StageResult(name="build", status=StageStatus.PASSED)
+
+        def test_action(ctx):
+            results["test"] = True
+            self.assertIn("build", ctx)
+            return StageResult(name="test", status=StageStatus.PASSED)
+
+        p = Pipeline()
+        p.add_stage(Stage(name="build", action=build_action))
+        p.add_stage(Stage(name="test", action=test_action, depends_on=["build"]))
+        run = p.execute()
+        self.assertEqual(run.status, PipelineStatus.PASSED)
+        self.assertIn("build", results)
+        self.assertIn("test", results)
+
+    def test_pipeline_failure(self):
+        p = Pipeline()
+        p.add_stage(self._make_fail("build"))
+        p.add_stage(self._make_pass("test"))
+        run = p.execute()
+        self.assertEqual(run.status, PipelineStatus.FAILED)
+
+    def test_gate_blocks_downstream(self):
+        """Gate failure should cancel downstream stages."""
+        p = Pipeline()
+        p.add_stage(Stage(name="build", action=lambda ctx: StageResult(name="build", status=StageStatus.FAILED), gate=True))
+        p.add_stage(Stage(name="test", action=lambda ctx: StageResult(name="test", status=StageStatus.PASSED), depends_on=["build"]))
+        run = p.execute()
+        self.assertEqual(run.status, PipelineStatus.FAILED)
+        # test stage should be cancelled
+        cancelled = [s for s in run.stage_results if s.status == StageStatus.CANCELLED]
+        self.assertTrue(len(cancelled) > 0)
+
+    def test_optional_failure(self):
+        """Optional stage failure should result in PARTIAL."""
+        p = Pipeline()
+        p.add_stage(self._make_pass("build"))
+        p.add_stage(Stage(name="lint", action=lambda ctx: StageResult(name="lint", status=StageStatus.FAILED), optional=True, depends_on=["build"]))
+        run = p.execute()
+        self.assertEqual(run.status, PipelineStatus.PARTIAL)
+
+    def test_skip_pipeline(self):
+        p = Pipeline()
+        p.add_stage(self._make_pass("build"))
+        run = p.execute(commit_message="[skip-ci] docs only")
+        self.assertEqual(run.status, PipelineStatus.SKIPPED)
+
+    def test_parallel_execution(self):
+        """Independent stages should run in parallel."""
+        order = []
+        lock = threading.Lock()
+        def slow_action(name, duration):
+            def action(ctx):
+                time.sleep(duration)
+                with lock:
+                    order.append(name)
+                return StageResult(name=name, status=StageStatus.PASSED)
+            return action
+
+        p = Pipeline(config=PipelineConfig(max_workers=4))
+        p.add_stage(Stage(name="a", action=slow_action("a", 0.05)))
+        p.add_stage(Stage(name="b", action=slow_action("b", 0.05)))
+        p.add_stage(Stage(name="c", action=slow_action("c", 0.05)))
+        run = p.execute()
+        self.assertEqual(run.status, PipelineStatus.PASSED)
+        self.assertEqual(len(run.stage_results), 3)
+
+    def test_cycle_detection(self):
+        p = Pipeline()
+        p.add_stage(Stage(name="a", action=lambda c: StageResult(name="a", status=StageStatus.PASSED), depends_on=["b"]))
+        p.add_stage(Stage(name="b", action=lambda c: StageResult(name="b", status=StageStatus.PASSED), depends_on=["a"]))
+        with self.assertRaises(ValueError):
+            p.execute()
+
+    def test_timeout(self):
+        def slow_action(ctx):
+            time.sleep(10)
+            return StageResult(name="slow", status=StageStatus.PASSED)
+
+        p = Pipeline(config=PipelineConfig(timeout=0.1))
+        p.add_stage(Stage(name="slow", action=slow_action))
+        run = p.execute()
+        self.assertEqual(run.status, PipelineStatus.TIMEOUT)
+
+    def test_summary(self):
+        p = Pipeline(config=PipelineConfig(name="test"))
+        p.add_stage(self._make_pass("build"))
+        p.execute()
+        p.execute()
+        s = p.summary()
+        self.assertEqual(s["total_runs"], 2)
+        self.assertEqual(s["passed"], 2)
+        self.assertEqual(s["pipeline"], "test")
+
+    def test_get_runs(self):
+        p = Pipeline()
+        p.add_stage(self._make_pass("x"))
+        p.execute()
+        runs = p.get_runs()
+        self.assertEqual(len(runs), 1)
+
+    def test_get_last_run(self):
+        p = Pipeline()
+        self.assertIsNone(p.get_last_run())
+        p.add_stage(self._make_pass("x"))
+        p.execute()
+        self.assertIsNotNone(p.get_last_run())
+
+
+# ===================================================================
+# Artifact Tests
+# ===================================================================
+
+class TestArtifact(unittest.TestCase):
+    def test_auto_checksum(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+            f.write("hello world")
+            path = f.name
+        try:
+            art = Artifact(name="test.txt", path=path)
+            self.assertTrue(art.checksum)
+            self.assertGreater(art.size_bytes, 0)
+            self.assertTrue(art.verify())
+        finally:
+            os.unlink(path)
+
+    def test_verify_tampered(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+            f.write("original")
+            path = f.name
+        try:
+            art = Artifact(name="t.txt", path=path)
+            with open(path, "w") as f:
+                f.write("tampered")
+            self.assertFalse(art.verify())
+        finally:
+            os.unlink(path)
+
+    def test_verify_missing_file(self):
+        art = Artifact(name="missing", path="/nonexistent/file.txt", checksum="abc123")
+        self.assertFalse(art.verify())
+
+    def test_to_dict(self):
+        art = Artifact(name="x", path="/tmp/x", checksum="abc", size_bytes=10, version="1.0")
+        d = art.to_dict()
+        self.assertEqual(d["name"], "x")
+        self.assertEqual(d["version"], "1.0")
+
+    def test_copy_to(self):
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "src.txt"
+            src.write_text("content")
+            art = Artifact(name="src.txt", path=str(src))
+            dest = Path(td) / "dest"
+            copied = art.copy_to(str(dest))
+            self.assertTrue(Path(copied.path).exists())
+            self.assertEqual(Path(copied.path).read_text(), "content")
+            self.assertTrue(copied.verify())
+
+    def test_sha256(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+            f.write("test")
+            path = f.name
+        try:
+            h = Artifact.sha256(Path(path))
+            self.assertEqual(len(h), 64)
+        finally:
+            os.unlink(path)
+
+
+class TestArtifactManager(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.mgr = ArtifactManager(base_dir=self.tmpdir)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_register_and_get(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+            f.write("data")
+            path = f.name
+        try:
+            art = self.mgr.register("myfile", path, version="1.0", artifact_type="build")
+            self.assertIsNotNone(art.checksum)
+            fetched = self.mgr.get("myfile", version="1.0")
+            self.assertIsNotNone(fetched)
+            self.assertEqual(fetched.version, "1.0")
+        finally:
+            os.unlink(path)
+
+    def test_find_by_type(self):
+        with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as f:
+            path = f.name
+        try:
+            self.mgr.register("a", path, artifact_type="build")
+            self.mgr.register("b", path, artifact_type="test-report")
+            found = self.mgr.find(artifact_type="build")
+            self.assertEqual(len(found), 1)
+            self.assertEqual(found[0].name, "a")
+        finally:
+            os.unlink(path)
+
+    def test_find_by_tag(self):
+        with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as f:
+            path = f.name
+        try:
+            self.mgr.register("a", path, tags=["production", "v2"])
+            self.mgr.register("b", path, tags=["staging"])
+            found = self.mgr.find(tag="production")
+            self.assertEqual(len(found), 1)
+        finally:
+            os.unlink(path)
+
+    def test_verify_all(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+            f.write("ok")
+            path = f.name
+        try:
+            self.mgr.register("a", path)
+            results = self.mgr.verify_all()
+            self.assertTrue(all(results.values()))
+        finally:
+            os.unlink(path)
+
+    def test_cleanup(self):
+        with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as f:
+            path = f.name
+        try:
+            for i in range(10):
+                self.mgr.register(f"art-{i}", path)
+            removed = self.mgr.cleanup(keep=5)
+            self.assertEqual(removed, 5)
+        finally:
+            os.unlink(path)
+
+    def test_remove(self):
+        with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as f:
+            path = f.name
+        try:
+            self.mgr.register("x", path)
+            self.assertTrue(self.mgr.remove("x"))
+            self.assertFalse(self.mgr.remove("x"))
+        finally:
+            os.unlink(path)
+
+    def test_list_all(self):
+        with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as f:
+            path = f.name
+        try:
+            self.mgr.register("a", path)
+            self.mgr.register("b", path)
+            all_arts = self.mgr.list_all()
+            self.assertEqual(len(all_arts), 2)
+        finally:
+            os.unlink(path)
+
+    def test_persistence(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+            f.write("persist")
+            path = f.name
+        try:
+            self.mgr.register("persist-test", path, version="1.0")
+            # Create new manager pointing to same dir
+            mgr2 = ArtifactManager(base_dir=self.tmpdir)
+            art = mgr2.get("persist-test", version="1.0")
+            self.assertIsNotNone(art)
+            self.assertEqual(art.version, "1.0")
+        finally:
+            os.unlink(path)
+
+
+# ===================================================================
+# Trigger Tests
+# ===================================================================
+
+class TestTriggerEvent(unittest.TestCase):
+    def test_auto_timestamp(self):
+        e = TriggerEvent(trigger_type=TriggerType.MANUAL)
+        self.assertTrue(e.timestamp)
+
+    def test_to_dict(self):
+        e = TriggerEvent(trigger_type=TriggerType.WEBHOOK, source="repo")
+        d = e.to_dict()
+        self.assertEqual(d["trigger_type"], "webhook")
+        self.assertEqual(d["source"], "repo")
+
+
+class TestTriggerManager(unittest.TestCase):
+    def setUp(self):
+        self.mgr = TriggerManager()
+
+    def test_register_and_fire(self):
+        fired = []
+        self.mgr.register("r1", TriggerType.MANUAL, callback=lambda e: fired.append(e))
+        triggered = self.mgr.fire(TriggerType.MANUAL)
+        self.assertIn("r1", triggered)
+        self.assertEqual(len(fired), 1)
+
+    def test_fire_no_match(self):
+        self.mgr.register("r1", TriggerType.MANUAL, callback=lambda e: None)
+        triggered = self.mgr.fire(TriggerType.WEBHOOK)
+        self.assertEqual(triggered, [])
+
+    def test_commit_pattern(self):
+        fired = []
+        self.mgr.register(
+            "deploy-tag",
+            TriggerType.COMMIT_PATTERN,
+            pattern=r"\[deploy\]",
+            callback=lambda e: fired.append(e),
+        )
+        triggered = self.mgr.fire(
+            TriggerType.COMMIT_PATTERN,
+            commit_message="fix: bug [deploy]",
+        )
+        self.assertIn("deploy-tag", triggered)
+        self.assertEqual(len(fired), 1)
+
+    def test_commit_pattern_no_match(self):
+        self.mgr.register(
+            "deploy-tag",
+            TriggerType.COMMIT_PATTERN,
+            pattern=r"\[deploy\]",
+            callback=lambda e: None,
+        )
+        triggered = self.mgr.fire(
+            TriggerType.COMMIT_PATTERN,
+            commit_message="fix: bug",
+        )
+        self.assertEqual(triggered, [])
+
+    def test_enable_disable(self):
+        fired = []
+        self.mgr.register("r1", TriggerType.MANUAL, callback=lambda e: fired.append(1))
+        self.mgr.disable("r1")
+        triggered = self.mgr.fire(TriggerType.MANUAL)
+        self.assertEqual(triggered, [])
+        self.assertEqual(len(fired), 0)
+        self.mgr.enable("r1")
+        triggered = self.mgr.fire(TriggerType.MANUAL)
+        self.assertIn("r1", triggered)
+
+    def test_unregister(self):
+        self.mgr.register("r1", TriggerType.MANUAL, callback=lambda e: None)
+        self.assertTrue(self.mgr.unregister("r1"))
+        self.assertFalse(self.mgr.unregister("r1"))
+
+    def test_history(self):
+        self.mgr.register("r1", TriggerType.MANUAL, callback=lambda e: None)
+        self.mgr.fire(TriggerType.MANUAL)
+        self.mgr.fire(TriggerType.MANUAL)
+        history = self.mgr.get_history()
+        self.assertEqual(len(history), 2)
+
+    def test_list_rules(self):
+        self.mgr.register("r1", TriggerType.MANUAL, callback=lambda e: None, pattern="test")
+        rules = self.mgr.list_rules()
+        self.assertEqual(len(rules), 1)
+        self.assertEqual(rules[0]["name"], "r1")
+        self.assertTrue(rules[0]["enabled"])
+
+
+# ===================================================================
+# Deploy Tests
+# ===================================================================
+
+class TestDeployResult(unittest.TestCase):
+    def test_to_dict(self):
+        r = DeployResult(
+            strategy=DeployStrategy.BLUE_GREEN,
+            target="prod",
+            version="2.0",
+            success=True,
+            message="ok",
+        )
+        d = r.to_dict()
+        self.assertEqual(d["strategy"], "blue_green")
+        self.assertTrue(d["success"])
+
+    def test_defaults(self):
+        r = DeployResult(strategy=DeployStrategy.DIRECT)
+        self.assertFalse(r.success)
+        self.assertFalse(r.rollback_performed)
+
+
+class TestDeployer(unittest.TestCase):
+    def test_direct_deploy(self):
+        d = Deployer()
+        result = d.deploy(DeployStrategy.DIRECT, "prod", "1.0")
+        self.assertTrue(result.success)
+        self.assertEqual(d.get_active_version("prod"), "1.0")
+
+    def test_direct_deploy_failure(self):
+        d = Deployer(deploy_action=lambda t, v, c: False)
+        result = d.deploy(DeployStrategy.DIRECT, "prod", "1.0")
+        self.assertFalse(result.success)
+
+    def test_blue_green(self):
+        d = Deployer()
+        result = d.deploy(DeployStrategy.BLUE_GREEN, "prod", "2.0", previous_version="1.0")
+        self.assertTrue(result.success)
+        self.assertEqual(d.get_active_version("prod"), "2.0")
+
+    def test_blue_green_green_fails(self):
+        d = Deployer(deploy_action=lambda t, v, c: t == "prod-green")
+        result = d.deploy(DeployStrategy.BLUE_GREEN, "prod", "2.0")
+        self.assertFalse(result.success)
+
+    def test_blue_green_unhealthy(self):
+        actions = {"count": 0}
+        def deploy_fn(target, version, config):
+            actions["count"] += 1
+            return True
+
+        def health_fn(target):
+            return "green" not in target  # green is unhealthy
+
+        d = Deployer(deploy_action=deploy_fn, health_check=health_fn)
+        result = d.deploy(DeployStrategy.BLUE_GREEN, "prod", "2.0")
+        self.assertFalse(result.success)
+
+    def test_canary(self):
+        steps_hit = []
+        def deploy_fn(target, version, config):
+            steps_hit.append(config.get("canary_percent"))
+            return True
+
+        d = Deployer(deploy_action=deploy_fn)
+        result = d.deploy(
+            DeployStrategy.CANARY, "prod", "3.0",
+            canary_steps=[25.0, 50.0, 100.0],
+        )
+        self.assertTrue(result.success)
+        self.assertEqual(steps_hit, [25.0, 50.0, 100.0])
+
+    def test_canary_failure_rollback(self):
+        steps_hit = []
+        def deploy_fn(target, version, config):
+            steps_hit.append(config.get("canary_percent"))
+            # Fail at 50%
+            return config.get("canary_percent", 0) <= 25.0
+
+        d = Deployer(deploy_action=deploy_fn)
+        result = d.deploy(
+            DeployStrategy.CANARY, "prod", "3.0",
+            previous_version="2.0",
+            canary_steps=[25.0, 50.0, 100.0],
+        )
+        self.assertFalse(result.success)
+        self.assertTrue(result.rollback_performed)
+
+    def test_rolling(self):
+        batches = []
+        def deploy_fn(target, version, config):
+            batches.append(config.get("batch"))
+            return True
+
+        d = Deployer(deploy_action=deploy_fn)
+        result = d.deploy(
+            DeployStrategy.ROLLING, "prod", "4.0",
+            deploy_config={"instances": 6, "batch_size": 2},
+        )
+        self.assertTrue(result.success)
+        self.assertEqual(batches, [1, 2, 3])
+
+    def test_rolling_failure(self):
+        batches = []
+        def deploy_fn(target, version, config):
+            batches.append(config.get("batch"))
+            return config.get("batch", 0) < 2
+
+        d = Deployer(deploy_action=deploy_fn)
+        result = d.deploy(
+            DeployStrategy.ROLLING, "prod", "4.0",
+            deploy_config={"instances": 3, "batch_size": 1},
+        )
+        self.assertFalse(result.success)
+
+    def test_rollback(self):
+        d = Deployer()
+        d.deploy(DeployStrategy.DIRECT, "prod", "2.0")
+        result = d.rollback("prod", "1.0")
+        self.assertTrue(result.success)
+        self.assertTrue(result.rollback_performed)
+        self.assertEqual(d.get_active_version("prod"), "1.0")
+
+    def test_unknown_strategy(self):
+        d = Deployer()
+        result = d.deploy(DeployStrategy.ROLLBACK, "prod", "1.0")
+        self.assertFalse(result.success)
+
+    def test_get_history(self):
+        d = Deployer()
+        d.deploy(DeployStrategy.DIRECT, "prod", "1.0")
+        d.deploy(DeployStrategy.DIRECT, "prod", "2.0")
+        history = d.get_history()
+        self.assertEqual(len(history), 2)
+
+    def test_active_version_unknown(self):
+        d = Deployer()
+        self.assertEqual(d.get_active_version("nonexistent"), "unknown")
+
+
+# ===================================================================
+# Integration Tests
+# ===================================================================
+
+class TestPipelineWithArtifacts(unittest.TestCase):
+    """Test pipeline producing artifacts via ArtifactManager."""
+
+    def test_pipeline_registers_artifact(self):
+        with tempfile.TemporaryDirectory() as td:
+            mgr = ArtifactManager(base_dir=os.path.join(td, "arts"))
+
+            def build_action(ctx):
+                # Simulate creating a build artifact
+                art_path = os.path.join(td, "build.zip")
+                with open(art_path, "w") as f:
+                    f.write("build-output")
+                mgr.register("build.zip", art_path, version="1.0", artifact_type="build")
+                return StageResult(name="build", status=StageStatus.PASSED)
+
+            p = Pipeline(config=PipelineConfig(name="with-artifacts"))
+            p.add_stage(Stage(name="build", action=build_action))
+            run = p.execute()
+            self.assertEqual(run.status, PipelineStatus.PASSED)
+            art = mgr.get("build.zip", version="1.0")
+            self.assertIsNotNone(art)
+            self.assertTrue(art.verify())
+
+
+class TestPipelineWithTriggers(unittest.TestCase):
+    """Test trigger manager firing pipeline execution."""
+
+    def test_trigger_starts_pipeline(self):
+        runs = []
+        def run_pipeline(event):
+            p = Pipeline(config=PipelineConfig(name="triggered"))
+            p.add_stage(Stage(name="build", action=lambda ctx: StageResult(
+                name="build", status=StageStatus.PASSED,
+            )))
+            run = p.execute(trigger=event.trigger_type.value)
+            runs.append(run)
+
+        triggers = TriggerManager()
+        triggers.register("on-push", TriggerType.WEBHOOK, callback=run_pipeline)
+        triggered = triggers.fire(TriggerType.WEBHOOK, source="my-repo", commit_sha="abc123")
+        self.assertIn("on-push", triggered)
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(runs[0].status, PipelineStatus.PASSED)
+
+
+class TestPipelineWithDeploy(unittest.TestCase):
+    """Test pipeline integrating with Deployer."""
+
+    def test_pipeline_deploys_on_pass(self):
+        deploys = []
+        def deploy_action(target, version, config):
+            deploys.append((target, version))
+            return True
+
+        deployer = Deployer(deploy_action=deploy_action)
+
+        def deploy_stage(ctx):
+            result = deployer.deploy(DeployStrategy.DIRECT, "prod", "1.0")
+            return StageResult(
+                name="deploy",
+                status=StageStatus.PASSED if result.success else StageStatus.FAILED,
+                message=result.message,
+            )
+
+        p = Pipeline(config=PipelineConfig(name="deploy-test"))
+        p.add_stage(Stage(name="build", action=lambda ctx: StageResult(name="build", status=StageStatus.PASSED)))
+        p.add_stage(Stage(name="deploy", action=deploy_stage, depends_on=["build"]))
+        run = p.execute()
+        self.assertEqual(run.status, PipelineStatus.PASSED)
+        self.assertEqual(deploys, [("prod", "1.0")])
+
+
+class TestEndToEnd(unittest.TestCase):
+    """Full end-to-end pipeline: stage → artifact → trigger → deploy."""
+
+    def test_full_flow(self):
+        with tempfile.TemporaryDirectory() as td:
+            art_mgr = ArtifactManager(base_dir=os.path.join(td, "arts"))
+            deployer = Deployer()
+
+            def build(ctx):
+                p = os.path.join(td, "app.tar.gz")
+                with open(p, "w") as f:
+                    f.write("app-binary")
+                art_mgr.register("app.tar.gz", p, version="2.0", artifact_type="build")
+                return StageResult(name="build", status=StageStatus.PASSED, artifacts=[p])
+
+            def test(ctx):
+                return StageResult(name="test", status=StageStatus.PASSED, message="5 passed")
+
+            def deploy(ctx):
+                r = deployer.deploy(DeployStrategy.BLUE_GREEN, "prod", "2.0")
+                return StageResult(
+                    name="deploy", status=StageStatus.PASSED if r.success else StageStatus.FAILED,
+                    message=r.message,
+                )
+
+            p = Pipeline(config=PipelineConfig(name="e2e"))
+            p.add_stage(Stage(name="build", action=build, gate=True))
+            p.add_stage(Stage(name="test", action=test, depends_on=["build"]))
+            p.add_stage(Stage(name="deploy", action=deploy, depends_on=["test"]))
+
+            run = p.execute(trigger="manual", commit_sha="deadbeef")
+            self.assertEqual(run.status, PipelineStatus.PASSED)
+            self.assertEqual(len(run.stage_results), 3)
+            self.assertIsNotNone(art_mgr.get("app.tar.gz", version="2.0"))
+            self.assertEqual(deployer.get_active_version("prod"), "2.0")
 
 
 # ===================================================================
